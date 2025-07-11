@@ -84,38 +84,20 @@ class TransformerQNetwork(nn.Module):
         Returns:
             q_values: Tensor of shape (B, T, n_actions, reward_size)
         """
-        if self.include_action_reward:
-            assert actions is not None and rewards is not None, "actions and rewards must be provided"
-            x = torch.cat([states, actions, rewards], dim=2)  # (B, T, obs + 1 + R)
-            batch_size, seq_len, _ = x.shape
+
+
+        batch_size, seq_len, _ = states.shape
+
+        if self.include_action_reward and actions is not None and rewards is not None:
+            x = torch.cat([states, actions.unsqueeze(-1), rewards], dim=2)
         else:
-            x = states  # solo osservazioni
+            x = states
 
-        
-
-        # Proiezione degli input nello spazio d_model
-        x = self.input_proj(x)  # (B, T, d_model)
-
-        # Aggiunta del positional encoding
+        x = self.input_proj(x)
         x = self.pos_encoder(x)
+        x = self.transformer_encoder(x)
+        x = self.head(x)
 
-        # Costruzione attention mask (opzionale)
-        if attention_mask is not None:
-            # Trasforma mask booleana in float (0 = maschera, -inf = maschera)
-            # PyTorch usa float mask: 0.0 = keep, -inf = mask
-            extended_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
-            extended_mask = extended_mask.to(dtype=torch.float32)
-            extended_mask = (1.0 - extended_mask) * -1e9  # 0 -> 0, 1 -> -inf
-            # TransformerEncoder in PyTorch accetta src_key_padding_mask invece
-            src_key_padding_mask = (attention_mask == 0)  # (B, T)
-        else:
-            src_key_padding_mask = None
-
-        # Trasformer Encoder
-        x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)  # (B, T, d_model)
-
-        # Head: produce Q-values
-        x = self.head(x)  # (B, T, n_actions * reward_size)
         return x.view(batch_size, seq_len, self.n_actions, self.reward_size)
 
 
@@ -126,7 +108,94 @@ class TransformerQNetwork(nn.Module):
         loss.backward()
         self.optimizer.step()
         return loss.item()
+    
 
+
+# ora implemento un Decision transformer
+
+import torch
+import torch.nn as nn
+
+class DecisionTransformer(nn.Module):
+    def __init__(
+        self,
+        state_dim,
+        act_dim,
+        hidden_size=128,
+        n_layer=3,
+        n_head=4,
+        dropout=0.1,
+        max_length=100,
+        action_embedding_dim=16
+    ):
+        super().__init__()
+
+        self.state_dim = state_dim
+        self.act_dim = act_dim
+        self.embed_dim = 1 + state_dim + action_embedding_dim  # RTG + state + action
+        self.hidden_size = hidden_size
+
+        # Proiezioni individuali
+        self.embed_return = nn.Linear(1, hidden_size)
+        self.embed_state = nn.Linear(state_dim, hidden_size)
+        self.embed_action = nn.Embedding(act_dim, action_embedding_dim)
+        self.action_proj = nn.Linear(action_embedding_dim, hidden_size)
+
+        self.embed_ln = nn.LayerNorm(hidden_size)
+
+        self.pos_embedding = nn.Parameter(torch.zeros(1, max_length, hidden_size))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=n_head,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layer)
+
+        self.predict_action = nn.Linear(hidden_size, act_dim)
+
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def forward(self, rtgs, states, actions=None):
+        """
+        rtgs: (B, T, 1)
+        states: (B, T, state_dim)
+        actions: (B, T) – previous actions as input (int), optional
+        """
+        B, T, _ = states.shape
+
+        # embeddings
+        rtg_embed = self.embed_return(rtgs)  # (B, T, H)
+        state_embed = self.embed_state(states)  # (B, T, H)
+
+        if actions is not None:
+            act_embed = self.embed_action(actions)  # (B, T, A_emb)
+            act_embed = self.action_proj(act_embed)  # (B, T, H)
+        else:
+            act_embed = torch.zeros_like(state_embed)  # per inferenza
+
+        token_embeddings = rtg_embed + state_embed + act_embed  # (B, T, H)
+
+        # Aggiungi embedding posizionali
+        token_embeddings = token_embeddings + self.pos_embedding[:, :T]
+        token_embeddings = self.embed_ln(token_embeddings)
+
+        x = self.transformer(token_embeddings)  # (B, T, H)
+
+        logits = self.predict_action(x)  # (B, T, act_dim)
+
+        return logits
+
+    def compute_loss(self, logits, target_actions):
+        """
+        logits: (B, T, act_dim)
+        target_actions: (B, T)
+        """
+        return self.loss_fn(
+            logits.reshape(-1, self.act_dim),
+            target_actions.reshape(-1)
+        )
 
 
 
@@ -152,76 +221,102 @@ if __name__ == "__main__":
     env = Jaywalker()
     episodes = 10000
     replay_frequency = 3
-    gamma = 0.95
-    learning_rate = 1e-2 #5e-4
+    gamma = 0.95 # Ancora rilevante per calcolare RTG nel buffer
+    learning_rate = 1e-4 # Il learning rate per AdamW
     epsilon_start = 1
-    epsilon_decay = 0.997 #0.995
+    epsilon_decay = 0.997
     epsilon_min = 0.01
     batch_size = 256
     train_start = 1000
-    target_model_update_rate = 1e-3
-    memory_length = 1500000 #100000
+    target_model_update_rate = 1e-3 # Non usato per DT, ma può restare per compatibilità
+    memory_length = 1500000
     mini_batches = 4
-    branch_size = 256
-    slack = 0.1
+    # branch_size = 256 # Non sembra usato nel codice
+    slack = 0.1 # Non usato per DT
     hidden = 128
     num_simulations = 1
     img_filename = "imgs/"
     simulations_filename = "imgs/simulations/"
     simulations = 0
 
-    network_type = sys.argv[1]
+    network_type = sys.argv[1] if len(sys.argv) > 1 else None # Gestisce il caso senza argomenti
 
-     # print used device
+    # print used device
     print(f"Device: {device}")
 
+    # Rimuovi il blocco 'if network_type is None:'
+    # e gestisci direttamente 'transformer'
     
+    # if network_type is None: # Questo blocco è superfluo ora
+    #     def network_constructor(obs, act, hidden, lr, weights):
+    #         return TransformerQNetwork(
+    #             n_observations=obs,
+    #         n_actions=act,
+    #         hidden=hidden,
+    #         learning_rate=lr,
+    #         reward_size=3
+    #     )
+    #     network = network_constructor
+    #     weights = None
 
-    #p = Pool(32)
     if network_type == "lex":
         network = Lex_Q_Network
         weights = None
+        agent_class = QAgent # Usa l'agente Q per reti Q-like
     
     elif network_type == "transformer":
-        def network_constructor(obs, act, hidden, lr, weights):
-            return TransformerQNetwork(
-                n_observations=obs,
-            n_actions=act,
-            hidden=hidden,
-            learning_rate=lr,
-            reward_size=3
-        )
-        network = network_constructor # in questo modo sto dicendo che il mio network
-                                        # è una funzione che prende in ingresso 5 parametri
-                                        # che alloco dentro la init del Qagent
-        weights = None
-
-
-
+        def network_constructor(obs, act, hidden_size, lr, weights_unused): # weights_unused per compatibilità
+            # Adatta la reward_dim se il tuo RTG non è scalare
+            return DecisionTransformer(
+                state_dim=obs,
+                act_dim=act,
+                hidden_size=hidden_size,
+                max_length=10, # Deve corrispondere a self.seq_len in DTAgent
+                reward_dim=1 # Se il tuo RTG è scalare
+            )
+        network = network_constructor
+        weights = None # Non usato dal DT
+        agent_class = DTAgent # Usa il nuovo agente Decision Transformer
 
     elif network_type == "weighted":
         network = Weighted_Q_Network
         weights = torch.tensor([1.0, 0.1, 0.01])
-
-        simulations = int(sys.argv[2])
+        simulations = int(sys.argv[2]) if len(sys.argv) > 2 else 1 # Assicurati che sys.argv[2] esista
+        agent_class = QAgent
 
         if simulations > 1:
             weights_list = [weights ** i for i in np.arange(1, simulations+1)]
             img_filename = "weighted_simulations/" + img_filename
             simulations_filename = "weighted_simulations/simulations/"
 
-    elif network_type == "sclar":
+    elif network_type == "scalar": # Corretto da "sclar" a "scalar"
         network = Scalar_Q_Network
+        agent_class = QAgent
 
     else:
-        raise ValueError("Network type" + network_type + "unknown")
+        raise ValueError("Network type " + str(network_type) + " unknown")
 
-    if simulations > 1:
+    # Inizializza l'agente con la classe corretta (QAgent o DTAgent)
+    agent = agent_class(network, env, learning_rate, batch_size, hidden, slack, epsilon_start, epsilon_decay, epsilon_min, episodes, gamma, train_start,
+                replay_frequency, target_model_update_rate, memory_length, mini_batches, weights) # slack e weights non usati da DT
+
+    # Aggiungi questa funzione di supporto per il main_body
+    def run_main_body(agent_instance, network_type_str, version_str=""):
+        agent_instance.learn()
+        agent_instance.plot_learning(31, title = "Jaywalker", filename = img_filename + network_type_str + "_" + version_str)
+        agent_instance.plot_epsilon(img_filename + network_type_str + "_" + version_str)
+        
+        for i in np.arange(num_simulations):
+            agent_instance.simulate(i, simulations_filename + network_type_str + "_" + version_str)
+        
+        agent_instance.save_model(network_type_str + "_" + version_str)
+
+    if simulations > 1 and network_type == "weighted": # Questa parte è specifica per "weighted"
         for i in np.arange(simulations):
             w = weights_list[i]
-
-            main_body(network, env, learning_rate, batch_size, hidden, slack, epsilon_start, epsilon_decay, epsilon_min, episodes, gamma, train_start,
-                replay_frequency, target_model_update_rate, memory_length, mini_batches, w, img_filename, simulations_filename, num_simulations, "v" + str(i) + "_")
+            # Ricrea l'agente per ogni set di pesi, perché QAgent è legato ai pesi
+            current_agent = agent_class(network, env, learning_rate, batch_size, hidden, slack, epsilon_start, epsilon_decay, epsilon_min, episodes, gamma, train_start,
+                replay_frequency, target_model_update_rate, memory_length, mini_batches, w)
+            run_main_body(current_agent, network_type, "v" + str(i) + "_")
     else:
-        main_body(network, env, learning_rate, batch_size, hidden, slack, epsilon_start, epsilon_decay, epsilon_min, episodes, gamma, train_start,
-                replay_frequency, target_model_update_rate, memory_length, mini_batches, weights, img_filename, simulations_filename, num_simulations)
+        run_main_body(agent, network_type) # Usa l'agente già creato
